@@ -1,0 +1,17 @@
+@cc [owner:ghuntley,label:security] secrets-outside-store
+The NixOS module MUST accept the mesh key and UI token through a runtime environment-file path and MUST NOT serialize those secrets into the Nix store.
+
+@cc [owner:ghuntley,label:security] mesh-port-tailnet-only
+The NixOS module MUST open the mesh port only on the interfaces listed in `meshInterfaces` (default `tailscale0`) and MUST NOT open it globally; the ingress port MUST NOT be opened at all.
+
+@cc [owner:ghuntley,label:testing] service-machine-test
+The NixOS machine tests MUST boot the service, verify authenticated and unauthenticated HTTP behaviour on the ingress, mesh, and monitor surfaces, verify that no secret reaches the journal, verify durable statistics across a restart, and verify cross-machine retry, stickiness, and peer loss in a multi-node mesh.
+
+@cc [owner:ghuntley,label:cli] service-cli-on-path
+Enabling `services.geoclass` MUST add its configured package to the host's system packages. With the default package, this exposes `geoclass` and `gtop` on PATH.
+
+@cc [owner:ghuntley,label:security] service-monitor-socket
+The service MUST create a Unix monitor socket at `/run/geoclass/monitor.sock` that local users can connect to without a token; network admin endpoints MUST retain token authentication.
+
+@cc [owner:ghuntley,label:config] regions-are-operator-data
+The module MUST pass region names, failure domains, and chase-the-sun weights through from options to `config.toml` without interpreting or defaulting any region by name.

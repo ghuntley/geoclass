@@ -1,0 +1,61 @@
+name: "CI"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: cachix/install-nix-action@v31
+      with:
+        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+    - uses: cachix/cachix-action@v17
+      with:
+        name: devenv
+
+    - name: Install devenv.sh
+      shell: bash
+      run: nix profile add nixpkgs#devenv
+
+    - name: Build the devenv shell and run pre-test checks
+      run: devenv test
+
+    - name: Compile
+      shell: devenv shell -- bash -e {0}
+      run: cargo build --locked --release
+
+    - name: Lint
+      shell: devenv shell -- bash -e {0}
+      run: cargo clippy --locked --all-targets -- -D warnings
+
+    - name: Run tests
+      shell: devenv shell -- bash -e {0}
+      run: cargo test --locked
+
+  nixos:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        check: [geoclass-module, geoclass-vm, geoclass-mesh-vm, geoclass-tailscale-vm]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: cachix/install-nix-action@v31
+      with:
+        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+    - uses: cachix/cachix-action@v17
+      with:
+        name: devenv
+
+    - name: Run ${{ matrix.check }}
+      run: nix --accept-flake-config build .#checks.x86_64-linux.${{ matrix.check }}

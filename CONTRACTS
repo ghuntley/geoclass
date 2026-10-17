@@ -1,0 +1,20 @@
+@cc [owner:ghuntley,label:security] no-secret-logging
+Request and response headers (including `Authorization` and `x-geoclass-mesh-key`), request and response bodies, raw prompt cache keys, raw account ids, the mesh key, and the UI token MUST NOT be logged, stored, gossiped, or emitted in errors, spans, statistics, or monitor snapshots. Sessions and accounts appear only as SHA-256 hashes (at most 12 characters in logs and snapshots).
+
+@cc [owner:ghuntley,label:security] credential-passthrough
+GeoClass MUST forward the client's credentials to the upstream unchanged and MUST NOT store them; it MUST strip every `x-geoclass-*` header (so the mesh key never leaves the mesh) and hop-by-hop headers before egress.
+
+@cc [owner:ghuntley,label:architecture] pure-sync-core
+`src/placement.rs`, `src/health.rs`, `src/bindings.rs`, `src/domains.rs`, `src/prior.rs`, `src/gate.rs`, `src/sse.rs`, and `src/stats.rs` MUST remain pure and synchronous: no tokio, no I/O, no wall-clock access — time enters as a parameter. Property tests in `tests/properties.rs` depend on this.
+
+@cc [owner:ghuntley,label:proxy] retry-only-before-output
+An attempt MAY be retried in another region only before any model output has been released to the client, and only for a capacity error code, a 5xx, or a transport failure. Account-scoped errors (429 quota, 401, 403) and every committed stream MUST reach the client unchanged.
+
+@cc [owner:ghuntley,label:architecture] regions-are-opaque
+No code MAY match on, default, or otherwise interpret a region name. Region names, failure domains, and chase-the-sun weights come only from operator configuration.
+
+@cc [owner:ghuntley,label:architecture] stats-never-route
+Routing (placement, health, bindings) MUST NOT read the statistics store; it uses only in-memory state built from this node's observations and gossip.
+
+@cc [owner:ghuntley,label:cli] nix-monitor-command
+The flake's geoclass package MUST put `geoclass` and `gtop` in `bin`; `gtop` MUST invoke `geoclass top` with all user arguments preserved.

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>geoclass — geo request router</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0d1117; color: #e6edf3; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.3rem; } h1 small { color: #8b949e; font-weight: normal; }
+  h2 { font-size: 1rem; margin: 0 0 8px; color: #c9d1d9; }
+  button, select, input { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-size: 0.85rem; }
+  button { cursor: pointer; } button:hover { background: #30363d; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  th { color: #8b949e; font-weight: 500; }
+  .wrap { overflow-x: auto; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; }
+  .green { background: #12331f; color: #3fb950; } .amber { background: #3d2e00; color: #d29922; } .red { background: #441418; color: #f85149; }
+  .off { background: #21262d; color: #8b949e; }
+  section.card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 16px; margin-top: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: #8b949e; font-size: 0.8rem; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .tile { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px; }
+  .tile b { display: block; font-size: 1.25rem; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .strip { display: flex; align-items: flex-end; gap: 1px; height: 46px; border-bottom: 1px solid #30363d; margin: 4px 0 10px; }
+  .strip > div { flex: 1 1 0; display: flex; flex-direction: column-reverse; height: 100%; min-width: 1px; }
+  .strip span { display: block; width: 100%; }
+  .ok { background: #3fb950; } .retry { background: #f85149; }
+  #login { max-width: 420px; margin: 80px auto; }
+  #login input { width: 100%; margin: 10px 0; }
+</style>
+</head>
+<body>
+<main>
+  <div id="login" class="card" hidden>
+    <h1>geoclass</h1>
+    <p class="muted">Paste the admin token (GEOCLASS_UI_TOKEN).</p>
+    <input id="token" type="password" autocomplete="off">
+    <button onclick="saveToken()">Continue</button>
+  </div>
+  <div id="app" hidden>
+    <h1>geoclass <small id="whoami"></small></h1>
+
+    <section class="card">
+      <h2>Regions</h2>
+      <div class="wrap"><table id="regions"><thead><tr>
+        <th>region</th><th>state</th><th>domain</th><th>available</th><th>weight</th><th>window attempts</th><th>overloaded</th><th>errors</th><th>rate</th><th>ttft</th><th>sessions</th><th>in flight</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="bins"></div>
+    </section>
+
+    <section class="card">
+      <h2>Peers</h2>
+      <div class="wrap"><table id="peers"><thead><tr><th>node</th><th>region</th><th>url</th><th>source</th><th>live</th><th>gossip age</th><th>in flight</th><th>version</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <div class="row" style="justify-content: space-between">
+        <h2>Statistics</h2>
+        <div class="row">
+          <select id="scope"><option value="cluster">cluster</option><option value="local">this node</option></select>
+          <select id="since"><option>6h</option><option selected>24h</option><option>7d</option><option>30d</option><option>90d</option><option>2y</option></select>
+          <select id="by"><option>total</option><option>region</option><option>ingress</option><option>model</option><option>region_model</option><option>domain</option><option>account</option></select>
+          <button onclick="loadStats()">Refresh</button>
+        </div>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="wrap" style="margin-top:12px"><table id="series"><thead></thead><tbody></tbody></table></div>
+      <p class="muted" id="statsnote"></p>
+    </section>
+
+    <section class="card">
+      <h2>Recent attempts</h2>
+      <div class="wrap"><table id="recent"><thead><tr><th>time</th><th>request</th><th>#</th><th>model</th><th>session</th><th>egress</th><th>node</th><th>reason</th><th>status</th><th>gate</th><th>outcome</th><th>code</th><th>ttft</th><th>duration</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <h2>Events</h2>
+      <div class="wrap"><table id="events"><thead><tr><th>time</th><th>kind</th><th>region</th><th>model</th><th>from → to</th><th>detail</th></tr></thead><tbody></tbody></table></div>
+    </section>
+  </div>
+</main>
+<script>
+let token = '';
+try { token = localStorage.getItem('geoclass_token') || ''; } catch (_) {}
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v) => (v ?? 0).toLocaleString();
+const pct = (v) => v == null ? '–' : (v * 100).toFixed(1) + '%';
+const ms = (v) => v == null ? '–' : v >= 1000 ? (v / 1000).toFixed(1) + 's' : v + 'ms';
+const time = (t) => new Date(t).toLocaleTimeString();
+const age = (v) => v == null ? '–' : v < 1000 ? v + 'ms' : (v / 1000).toFixed(0) + 's';
+
+function saveToken() {
+  token = $('token').value.trim();
+  try { localStorage.setItem('geoclass_token', token); } catch (_) {}
+  start();
+}
+
+async function api(path) {
+  const r = await fetch(path, { headers: { Authorization: 'Bearer ' + token } });
+  if (r.status === 401) { $('app').hidden = true; $('login').hidden = false; throw new Error('unauthorized'); }
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || ('HTTP ' + r.status));
+  return r.json();
+}
+
+function badge(state) { return `<span class="badge ${esc(state)}">${esc(state)}</span>`; }
+
+async function loadMonitor() {
+  const m = await api('/admin/api/monitor');
+  $('whoami').textContent = `${m.node} · region ${m.region} · v${m.version} · ${m.inflight} in flight · ${num(m.bindings_total)} sessions bound`;
+  $('regions').tBodies[0].innerHTML = m.regions.map((r) => `<tr>
+    <td>${esc(r.name)}${r.local ? ' <span class="muted">(local)</span>' : ''}</td>
+    <td>${badge(r.state)} ${Object.entries(r.models || {}).map(([k, v]) => `<span class="muted">${esc(k)}</span> ${badge(v)}`).join(' ')}</td>
+    <td>${esc(r.domain)}</td><td>${r.available ? 'yes' : '<span class="badge off">no</span>'}</td>
+    <td>${r.weight.toFixed(2)} <span class="muted">(cfg ${r.configured_weight.toFixed(2)})</span></td>
+    <td>${num(r.attempts)}</td><td>${num(r.overloaded)}</td><td>${num(r.errors)}</td><td>${pct(r.rate)}</td>
+    <td>${ms(r.ttft_mean_ms)}</td><td>${num(r.bindings)}</td><td>${num(r.inflight)}</td></tr>`).join('');
+  $('bins').innerHTML = Object.entries(m.minute_bins).map(([region, bins]) => {
+    const max = Math.max(1, ...bins.map((b) => b[0]));
+    return `<div class="muted">${esc(region)} — last 60 min (green served, red retried away)</div><div class="strip">${bins.map(([a, r]) =>
+      `<div title="${a} attempts, ${r} retried"><span class="ok" style="height:${(a - r) / max * 100}%"></span><span class="retry" style="height:${r / max * 100}%"></span></div>`).join('')}</div>`;
+  }).join('');
+  $('peers').tBodies[0].innerHTML = m.peers.map((p) => `<tr><td>${esc(p.node_id || p.host)}</td><td>${esc(p.region || '–')}</td><td>${esc(p.url)}</td>
+    <td>${esc(p.source)}</td><td>${p.live ? badge('green') : badge('red')}</td><td>${age(p.gossip_age_ms)}</td><td>${num(p.inflight)}</td><td>${esc(p.version || '')}</td></tr>`).join('')
+    || '<tr><td colspan="8" class="muted">no peers discovered</td></tr>';
+  $('recent').tBodies[0].innerHTML = m.recent.map((a) => `<tr><td>${time(a.ts)}</td><td>${esc(a.request_id.slice(0, 8))}</td><td>${a.attempt_no}</td>
+    <td>${esc(a.model)}</td><td>${esc(a.session)}</td><td>${esc(a.egress_region)}</td><td>${esc(a.egress_node)}</td><td>${esc(a.reason)}</td>
+    <td>${a.status}</td><td>${a.gate === 'retried' || a.gate === 'exhausted' ? badge('red').replace('red</', a.gate + '</') : esc(a.gate)}</td>
+    <td>${esc(a.outcome || '–')}</td><td>${esc(a.error_code || '')}</td><td>${ms(a.ttft_ms)}</td><td>${ms(a.duration_ms)}</td></tr>`).join('');
+  $('events').tBodies[0].innerHTML = m.events.map((e) => `<tr><td>${time(e.ts)}</td><td>${esc(e.kind)}</td><td>${esc(e.region || '')}</td>
+    <td>${esc(e.model || '')}</td><td>${esc(e.from_region || '')}${e.to_region ? ' → ' + esc(e.to_region) : ''}</td><td>${esc(e.detail || '')}</td></tr>`).join('');
+}
+
+function tiles(t) {
+  const rescue = t.overload_hit ? t.rescued / t.overload_hit : null;
+  const cache = t.input_tokens ? t.cached_input_tokens / t.input_tokens : null;
+  const moved = t.moved_input_tokens ? t.moved_cached_input_tokens / t.moved_input_tokens : null;
+  const stayed = (t.input_tokens - t.moved_input_tokens) ? (t.cached_input_tokens - t.moved_cached_input_tokens) / (t.input_tokens - t.moved_input_tokens) : null;
+  return [
+    ['requests', num(t.requests)], ['attempts', num(t.attempts)], ['sessions', num(t.sessions)],
+    ['rescue rate', pct(rescue)], ['overload hits', num(t.overload_hit)], ['retried attempts', num(t.retried)],
+    ['cache hit', pct(cache)], ['cache hit (stayed)', pct(stayed)], ['cache hit (moved)', pct(moved)],
+    ['tokens in / out', num(t.input_tokens) + ' / ' + num(t.output_tokens)],
+    ['mean ttft', ms(t.ttft_n ? Math.round(t.ttft_sum_ms / t.ttft_n) : null)], ['mean gate hold', ms(t.held_n ? Math.round(t.held_sum_ms / t.held_n) : null)],
+    ['peak concurrency', num(t.peak_concurrency)], ['session moves', num((t.events || {}).session_moved)], ['regions went red', num((t.events || {}).region_red)],
+  ].map(([k, v]) => `<div class="tile"><span class="muted">${k}</span><b>${v}</b></div>`).join('');
+}
+
+async function loadStats() {
+  const q = new URLSearchParams({ scope: $('scope').value, since: $('since').value, by: $('by').value });
+  const days = { '6h': 0.25, '24h': 1 }[$('since').value];
+  q.set('bucket', days ? 'hour' : 'day');
+  try {
+    const s = await api('/admin/api/stats?' + q);
+    $('tiles').innerHTML = tiles(s.totals);
+    const rows = s.series.length ? s.series : [{ key: 'total', label: 'total', totals: s.totals }];
+    $('series').tHead.innerHTML = '<tr><th>' + esc(s.by) + '</th><th>requests</th><th>attempts</th><th>retried</th><th>rescued</th><th>rescue rate</th><th>cache hit</th><th>tokens in</th><th>tokens out</th><th>mean ttft</th><th>peak conc.</th><th>gates</th></tr>';
+    $('series').tBodies[0].innerHTML = rows.map((r) => { const t = r.totals; return `<tr><td>${esc(r.label)}</td><td>${num(t.requests)}</td><td>${num(t.attempts)}</td>
+      <td>${num(t.retried)}</td><td>${num(t.rescued)}</td><td>${pct(t.overload_hit ? t.rescued / t.overload_hit : null)}</td>
+      <td>${pct(t.input_tokens ? t.cached_input_tokens / t.input_tokens : null)}</td><td>${num(t.input_tokens)}</td><td>${num(t.output_tokens)}</td>
+      <td>${ms(t.ttft_n ? Math.round(t.ttft_sum_ms / t.ttft_n) : null)}</td><td>${num(t.peak_concurrency)}</td>
+      <td class="muted">${esc(Object.entries(t.gates || {}).map(([k, v]) => k + ' ' + v).join(', '))}</td></tr>`; }).join('');
+    const failed = (s.nodes || []).filter((n) => !n.ok);
+    $('statsnote').textContent = `${s.scope} scope · ${(s.nodes || []).length} node(s)` + (failed.length ? ` · unreachable: ${failed.map((n) => n.node).join(', ')}` : '')
+      + (s.distinct_exact ? '' : ' · requests and sessions are summed across nodes (upper bounds)');
+  } catch (e) { $('statsnote').textContent = 'stats: ' + e.message; }
+}
+
+async function start() {
+  if (!token) { $('login').hidden = false; return; }
+  $('login').hidden = true; $('app').hidden = false;
+  try { await loadMonitor(); await loadStats(); } catch (_) { return; }
+  setInterval(() => loadMonitor().catch(() => {}), 3000);
+}
+['scope', 'since', 'by'].forEach((id) => $(id).addEventListener('change', loadStats));
+start();
+</script>
+</body>
+</html>

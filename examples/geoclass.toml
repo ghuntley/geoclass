@@ -1,0 +1,51 @@
+# Example GeoClass configuration (~/.config/geoclass/config.toml, or GEOCLASS_CONFIG).
+#
+# Regions are yours to name; GeoClass never interprets them. The weights below encode public
+# research from October 2026 (see README "Where OpenAI serves from") and are only a starting
+# point: live health and the learned prior adjust them.
+#
+# Secrets do not belong here: set GEOCLASS_MESH_KEY (same on every node) and GEOCLASS_UI_TOKEN
+# in the environment.
+
+region = "us"                       # this node's region; or --region / GEOCLASS_REGION
+# node_id = "us-1"                  # default: hostname
+# ingress_bind = "127.0.0.1:9090"   # underclass points here
+# mesh_bind = "0.0.0.0:9091"        # firewall it to tailscale0
+# discovery = "tailscale"           # or "static" with peers = ["http://10.0.0.2:9091"]
+# tailscale_tag = "tag:geoclass"
+# upstream = "https://chatgpt.com"
+# stats_retention_days = 730
+# retry_deadline_ms = 120000
+# gate_max_bytes = 262144
+
+[thresholds]
+window_ms = 300000   # 5-minute sliding health window
+red_rate = 0.10      # overload rate that turns a region red
+green_rate = 0.03    # ...and back to green
+min_samples = 5
+
+# America: biggest capacity, busiest during US working hours (14:00-01:00 UTC).
+[[regions]]
+name = "us"
+failure_domain = "us"
+hourly = [1.0, 0.8, 1.0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.0, 0.8,
+          0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.6, 0.8]
+weekend = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+           1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# Germany: an EU serving pool exists; its evening overlaps the US working day.
+[[regions]]
+name = "de"
+failure_domain = "eu"
+utc_offset_hours = 1.0
+peak_hours = [9, 18]
+peak_weight = 0.6
+weight = 1.2
+
+# Australia: no in-country inference; probably served from APAC or US capacity. Leave its
+# failure domain unset and let GeoClass learn whether it moves with "us".
+[[regions]]
+name = "au"
+utc_offset_hours = 10.0
+peak_hours = [9, 18]
+peak_weight = 0.7

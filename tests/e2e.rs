@@ -252,6 +252,21 @@ async fn overload_before_output_is_retried_elsewhere_and_the_session_sticks() {
     assert_eq!(stats["totals"]["overload_hit"], 2);
     assert!(stats["totals"]["events"]["session_moved"].as_i64().is_some_and(|n| n >= 1), "{}", stats["totals"]);
     assert!(stats["totals"]["cached_input_tokens"].as_i64().unwrap() >= 80);
+
+    // Latency distributions survive the cluster merge, and peer-served attempts record the hop.
+    let hist_total = |name: &str| stats["totals"][name].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).sum::<i64>();
+    assert!(hist_total("ttft_hist") >= 5, "every committed attempt has a TTFT: {}", stats["totals"]);
+    assert!(hist_total("hop_hist") >= 1 && stats["totals"]["hop_n"].as_i64().unwrap() == hist_total("hop_hist"));
+    assert_eq!(stats["hist_bounds_ms"].as_array().unwrap().len(), geoclass::hist::BOUNDS_MS.len());
+
+    // Egress nodes report the colo they reach, and every node learns it through gossip.
+    c.wait_until("every node knows the served region's colo", |c| {
+        c.nodes.iter().all(|n| {
+            let mesh = n.state.mesh.lock().unwrap();
+            n.state.region_colos(&mesh, geoclass::now_ms()).get(&served).map(String::as_str) == Some("TST")
+        })
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -205,6 +205,7 @@ pub async fn relay_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     finish.record.status = status.as_u16();
     finish.record.headers_ms = Some(headers_ms);
     finish.record.cf_colo = cf_colo(response.headers());
+    state.note_egress_colo(finish.record.cf_colo.as_deref());
     let mut out_headers = response_headers(response.headers());
     if let Ok(v) = HeaderValue::from_str(&state.cfg.node_id) {
         out_headers.insert(state::NODE_HEADER, v);

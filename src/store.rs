@@ -2,7 +2,8 @@
 //!
 //! Routing never reads this store: placement uses only gossip. Losing the file loses history, not
 //! routing state. Schema and rollups follow underclass ADR 0021.
-use crate::stats::{self, CountRow, Dim, Interval, Series, Tallies, TallyRow, Totals};
+use crate::hist::{self, Hist};
+use crate::stats::{self, CountRow, Dim, HistRow, Interval, Series, Tallies, TallyRow, Totals};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -39,6 +40,10 @@ pub struct AttemptRecord {
     pub saw_output: Option<bool>,
     pub ttft_ms: Option<i64>,
     pub held_ms: Option<i64>,
+    /// Time the relay hop added for attempts sent through a peer: time to response headers seen
+    /// here minus the peer's own time to upstream headers.
+    #[serde(default)]
+    pub hop_ms: Option<i64>,
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -109,6 +114,10 @@ pub struct HealthSample {
     pub state: String,
     pub weight: f64,
     pub ttft_mean_ms: Option<i64>,
+    #[serde(default)]
+    pub ttft_p50_ms: Option<i64>,
+    #[serde(default)]
+    pub ttft_p95_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -118,7 +127,29 @@ pub struct RelaySummary {
     pub errors: i64,
     pub mean_duration_ms: i64,
     pub mean_headers_ms: Option<i64>,
+    /// Distribution of the upstream's time to response headers, as seen by this node.
+    #[serde(default)]
+    pub headers_hist: Hist,
     pub bytes: i64,
+}
+
+impl RelaySummary {
+    /// Adds another node's summary for the same requesting region.
+    pub fn add(&mut self, other: &RelaySummary) {
+        let n = self.requests + other.requests;
+        if n > 0 {
+            self.mean_duration_ms = (self.mean_duration_ms * self.requests + other.mean_duration_ms * other.requests) / n;
+        }
+        let (a, b) = (self.headers_hist.count(), other.headers_hist.count());
+        self.mean_headers_ms = match (self.mean_headers_ms, other.mean_headers_ms) {
+            (Some(x), Some(y)) if a + b > 0 => Some((x * a + y * b) / (a + b)),
+            (x, y) => x.or(y),
+        };
+        self.requests = n;
+        self.errors += other.errors;
+        self.bytes += other.bytes;
+        self.headers_hist.add(&other.headers_hist);
+    }
 }
 
 fn schema() -> &'static str {
@@ -151,6 +182,7 @@ fn schema() -> &'static str {
         saw_output INTEGER,
         ttft_ms INTEGER,
         held_ms INTEGER,
+        hop_ms INTEGER,
         input_tokens INTEGER,
         cached_input_tokens INTEGER,
         output_tokens INTEGER,
@@ -201,6 +233,8 @@ fn schema() -> &'static str {
         state TEXT NOT NULL,
         weight REAL NOT NULL,
         ttft_mean_ms INTEGER,
+        ttft_p50_ms INTEGER,
+        ttft_p95_ms INTEGER,
         UNIQUE (ts, region, model)
     );
     CREATE INDEX IF NOT EXISTS health_samples_ts ON health_samples(ts);
@@ -214,6 +248,25 @@ fn schema() -> &'static str {
         PRIMARY KEY (day, dim, key)
     );
     "#
+}
+
+/// Columns added after the first release, for files created before them.
+const ADDED_COLUMNS: [(&str, &str, &str); 3] =
+    [("attempts", "hop_ms", "INTEGER"), ("health_samples", "ttft_p50_ms", "INTEGER"), ("health_samples", "ttft_p95_ms", "INTEGER")];
+
+/// @cc [owner:ghuntley,label:accounting] store-migrates-in-place
+/// `init` MUST create every table and MUST add each `ADDED_COLUMNS` entry missing from an existing
+/// file without touching its rows.
+fn init(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(schema())?;
+    for (table, column, kind) in ADDED_COLUMNS {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let present = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !present.iter().any(|c| c == column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn attempt_dim_sql(dim: Dim) -> (&'static str, &'static str) {
@@ -250,13 +303,13 @@ impl Store {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(schema())?;
+        init(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
     pub fn in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(schema())?;
+        init(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -280,12 +333,12 @@ impl Store {
             "INSERT INTO attempts (request_id, attempt_no, ts, duration_ms, endpoint, model, session, account, \
              ingress_region, egress_region, egress_node, failure_domain, cf_colo, placement_reason, status, gate_result, \
              stream_outcome, error_code, saw_output, ttft_ms, held_ms, input_tokens, cached_input_tokens, output_tokens, \
-             overload_hit, rescued) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
+             overload_hit, rescued, hop_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
                 r.request_id, r.attempt_no, r.ts, r.duration_ms, r.endpoint, r.model, r.session, r.account,
                 r.ingress_region, r.egress_region, r.egress_node, r.failure_domain, r.cf_colo, r.placement_reason,
                 r.status, r.gate_result, r.stream_outcome, r.error_code, r.saw_output, r.ttft_ms, r.held_ms,
-                r.input_tokens, r.cached_input_tokens, r.output_tokens, r.overload_hit, r.rescued
+                r.input_tokens, r.cached_input_tokens, r.output_tokens, r.overload_hit, r.rescued, r.hop_ms
             ],
         )?;
         Ok(())
@@ -316,9 +369,12 @@ impl Store {
         let tx = conn.transaction()?;
         for s in samples {
             tx.execute(
-                "INSERT OR REPLACE INTO health_samples (ts, region, model, domain, attempts, overloaded, errors, state, weight, ttft_mean_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![s.ts, s.region, s.model, s.domain, s.attempts, s.overloaded, s.errors, s.state, s.weight, s.ttft_mean_ms],
+                "INSERT OR REPLACE INTO health_samples (ts, region, model, domain, attempts, overloaded, errors, state, weight, ttft_mean_ms, \
+                 ttft_p50_ms, ttft_p95_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    s.ts, s.region, s.model, s.domain, s.attempts, s.overloaded, s.errors, s.state, s.weight, s.ttft_mean_ms,
+                    s.ttft_p50_ms, s.ttft_p95_ms
+                ],
             )?;
         }
         tx.commit()
@@ -328,13 +384,14 @@ impl Store {
     pub fn health_samples(&self, from: i64, to: i64, model: &str) -> rusqlite::Result<Vec<HealthSample>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT ts, region, model, domain, attempts, overloaded, errors, state, weight, ttft_mean_ms FROM health_samples \
+            "SELECT ts, region, model, domain, attempts, overloaded, errors, state, weight, ttft_mean_ms, ttft_p50_ms, ttft_p95_ms FROM health_samples \
              WHERE ts >= ?1 AND ts < ?2 AND model = ?3 ORDER BY ts, region",
         )?;
         let rows = stmt.query_map(params![from, to, model], |r| {
             Ok(HealthSample {
                 ts: r.get(0)?, region: r.get(1)?, model: r.get(2)?, domain: r.get(3)?, attempts: r.get(4)?,
                 overloaded: r.get(5)?, errors: r.get(6)?, state: r.get(7)?, weight: r.get(8)?, ttft_mean_ms: r.get(9)?,
+                ttft_p50_ms: r.get(10)?, ttft_p95_ms: r.get(11)?,
             })
         })?;
         rows.collect()
@@ -345,7 +402,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT request_id, attempt_no, ts, duration_ms, endpoint, model, session, account, ingress_region, egress_region, \
              egress_node, failure_domain, cf_colo, placement_reason, status, gate_result, stream_outcome, error_code, saw_output, \
-             ttft_ms, held_ms, input_tokens, cached_input_tokens, output_tokens, overload_hit, rescued FROM attempts ORDER BY id DESC LIMIT ?1",
+             ttft_ms, held_ms, input_tokens, cached_input_tokens, output_tokens, overload_hit, rescued, hop_ms FROM attempts ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok(AttemptRecord {
@@ -355,6 +412,7 @@ impl Store {
                 status: r.get(14)?, gate_result: r.get(15)?, stream_outcome: r.get(16)?, error_code: r.get(17)?,
                 saw_output: r.get(18)?, ttft_ms: r.get(19)?, held_ms: r.get(20)?, input_tokens: r.get(21)?,
                 cached_input_tokens: r.get(22)?, output_tokens: r.get(23)?, overload_hit: r.get(24)?, rescued: r.get(25)?,
+                hop_ms: r.get(26)?,
             })
         })?;
         rows.collect()
@@ -407,13 +465,28 @@ impl Store {
              CAST(AVG(duration_ms) AS INTEGER), CAST(AVG(headers_ms) AS INTEGER), COALESCE(SUM(bytes),0) \
              FROM relay_attempts WHERE ts >= ?1 AND ts < ?2 GROUP BY from_region ORDER BY from_region",
         )?;
-        let rows = stmt.query_map(params![from, to], |r| {
-            Ok(RelaySummary {
-                from_region: r.get(0)?, requests: r.get(1)?, errors: r.get(2)?, mean_duration_ms: r.get(3)?,
-                mean_headers_ms: r.get(4)?, bytes: r.get(5)?,
-            })
-        })?;
-        rows.collect()
+        let mut out: Vec<RelaySummary> = stmt
+            .query_map(params![from, to], |r| {
+                Ok(RelaySummary {
+                    from_region: r.get(0)?, requests: r.get(1)?, errors: r.get(2)?, mean_duration_ms: r.get(3)?,
+                    mean_headers_ms: r.get(4)?, bytes: r.get(5)?, ..Default::default()
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT from_region, {} AS i, COUNT(*) FROM relay_attempts WHERE ts >= ?1 AND ts < ?2 AND headers_ms IS NOT NULL \
+             GROUP BY from_region, i",
+            hist::sql_bucket("headers_ms")
+        ))?;
+        let rows = stmt.query_map(params![from, to], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        for row in rows {
+            let (region, index, count) = row?;
+            if let Some(summary) = out.iter_mut().find(|s| s.from_region == region)
+                && let Some(slot) = usize::try_from(index).ok().and_then(|i| summary.headers_hist.0.get_mut(i)) {
+                    *slot += count;
+                }
+        }
+        Ok(out)
     }
 
     /// Per-bucket counts from `attempts` with `ts` in `[from, to)`.
@@ -427,7 +500,8 @@ impl Store {
              SUM(CASE WHEN status BETWEEN 200 AND 299 AND gate_result IN ('output','terminal','overflow','eof') \
                  AND (input_tokens IS NULL OR output_tokens IS NULL) THEN 1 ELSE 0 END), \
              SUM(CASE WHEN gate_result = 'retried' THEN 1 ELSE 0 END), SUM(overload_hit), SUM(rescued), \
-             COALESCE(SUM(ttft_ms),0), COUNT(ttft_ms), COALESCE(SUM(held_ms),0), COUNT(held_ms) \
+             COALESCE(SUM(ttft_ms),0), COUNT(ttft_ms), COALESCE(SUM(held_ms),0), COUNT(held_ms), \
+             COALESCE(SUM(hop_ms),0), COUNT(hop_ms) \
              FROM attempts WHERE ts >= ?1 AND ts < ?2 GROUP BY b, k"
         );
         let conn = self.conn.lock().unwrap();
@@ -438,7 +512,7 @@ impl Store {
                 sessions: r.get(5)?, input_tokens: r.get(6)?, cached_input_tokens: r.get(7)?, output_tokens: r.get(8)?,
                 moved_input_tokens: r.get(9)?, moved_cached_input_tokens: r.get(10)?, unmeasured: r.get(11)?,
                 retried: r.get(12)?, overload_hit: r.get(13)?, rescued: r.get(14)?, ttft_sum_ms: r.get(15)?,
-                ttft_n: r.get(16)?, held_sum_ms: r.get(17)?, held_n: r.get(18)?,
+                ttft_n: r.get(16)?, held_sum_ms: r.get(17)?, held_n: r.get(18)?, hop_sum_ms: r.get(19)?, hop_n: r.get(20)?,
             })
         })?;
         rows.collect()
@@ -462,6 +536,22 @@ impl Store {
         self.tally(&sql, from, to, bucket_ms)
     }
 
+    /// Latency histogram rows for `column` (bucket index per `hist::bucket_of`).
+    fn attempt_hist(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim, column: &str) -> rusqlite::Result<Vec<HistRow>> {
+        let (key, label) = attempt_dim_sql(dim);
+        let sql = format!(
+            "SELECT (ts - ?1) / ?3 AS b, {key} AS k, MAX({label}), {} AS i, COUNT(*) \
+             FROM attempts WHERE ts >= ?1 AND ts < ?2 AND {column} IS NOT NULL GROUP BY b, k, i",
+            hist::sql_bucket(column)
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to, bucket_ms], |r| {
+            Ok(HistRow { bucket: r.get(0)?, key: r.get(1)?, label: r.get(2)?, index: r.get::<_, i64>(3)? as usize, count: r.get(4)? })
+        })?;
+        rows.collect()
+    }
+
     pub fn stats_tallies(&self, from: i64, to: i64, bucket_ms: i64, dim: Dim) -> rusqlite::Result<Tallies> {
         let outcome = "COALESCE(stream_outcome, CASE WHEN status = 0 THEN 'network_error' WHEN status BETWEEN 200 AND 299 THEN 'unknown' ELSE 'http_' || status END)";
         let key = event_dim_sql(dim);
@@ -473,6 +563,9 @@ impl Store {
             events: self.tally(&events_sql, from, to, bucket_ms)?,
             gates: self.attempt_tally(from, to, bucket_ms, dim, "gate_result")?,
             reasons: self.attempt_tally(from, to, bucket_ms, dim, "placement_reason")?,
+            ttft: self.attempt_hist(from, to, bucket_ms, dim, "ttft_ms")?,
+            held: self.attempt_hist(from, to, bucket_ms, dim, "held_ms")?,
+            hop: self.attempt_hist(from, to, bucket_ms, dim, "hop_ms")?,
         })
     }
 
@@ -635,6 +728,46 @@ mod tests {
         assert_eq!(t.reasons.get("moved_failure"), Some(&1));
         let by_region = store.stats_series(0, 60_000, 60_000, Dim::Region).unwrap();
         assert_eq!(by_region.len(), 2);
+    }
+
+    #[test]
+    fn latency_percentiles_and_sql_buckets_match_the_histogram() {
+        let store = Store::in_memory().unwrap();
+        let values = [0, 25, 26, 99, 100, 4_999, 60_000, 60_001, 900_000];
+        let mut expected = Hist::default();
+        for (i, v) in values.iter().enumerate() {
+            let mut a = attempt(&format!("r{i}"), 0, 1_000, "a", "output");
+            a.ttft_ms = Some(*v);
+            a.hop_ms = Some(*v);
+            store.insert_attempt(&a).unwrap();
+            expected.record(*v);
+        }
+        let series = store.stats_series(0, 60_000, 60_000, Dim::Total).unwrap();
+        let t = &series[0].buckets[0].totals;
+        assert_eq!(t.ttft_hist, expected);
+        assert_eq!(t.hop_hist, expected);
+        assert_eq!(t.hop_n, values.len() as i64);
+        assert_eq!((t.ttft_hist.p50(), t.ttft_hist.p95()), (Some(100), Some(60_000)));
+    }
+
+    #[test]
+    fn opening_an_old_file_adds_new_columns() {
+        let dir = std::env::temp_dir().join(format!("geoclass-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&schema().replace("        hop_ms INTEGER,\n", "")).unwrap();
+            conn.execute_batch("INSERT INTO config (key, value) VALUES ('k', 'v')").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.config_get("k").as_deref(), Some("v"));
+        let mut a = attempt("r1", 0, 1_000, "a", "output");
+        a.hop_ms = Some(7);
+        store.insert_attempt(&a).unwrap();
+        assert_eq!(store.recent_attempts(1).unwrap()[0].hop_ms, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

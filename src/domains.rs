@@ -1,9 +1,15 @@
 //! Failure domains: groups of egress regions that share an upstream serving pool.
 //!
 //! Operators group regions they already know share a pool (`failure_domain`). On top of that,
-//! regions whose per-minute failure rates rise and fall together are merged: if one is
-//! overloaded the other almost certainly is too, so a retry should leave the whole domain first.
-//! Learning only ever merges; it never splits an operator group. Pure and synchronous.
+//! learning merges regions that behave as one pool:
+//! - per-minute failure rates rise and fall together (strong evidence on its own), or
+//! - failure rates move together more weakly and are corroborated, either by time to first
+//!   output rising and falling together or by both regions' egress reaching the same Cloudflare
+//!   colo (`cf-ray` suffix).
+//!
+//! If one region of a domain is overloaded the others almost certainly are too, so a retry should
+//! leave the whole domain first. Learning only ever merges; it never splits an operator group.
+//! Pure and synchronous.
 use crate::config::RegionConfig;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -11,9 +17,25 @@ const HISTORY_MINUTES: usize = 360;
 const MIN_SHARED: usize = 30;
 const MIN_EPISODE_MINUTES: usize = 3;
 const EPISODE_RATE: f64 = 0.10;
-const MERGE_CORRELATION: f64 = 0.8;
+/// Failure correlation that merges two regions on its own.
+pub const MERGE_CORRELATION: f64 = 0.8;
+/// Failure correlation that merges two regions when another signal corroborates it.
+pub const CORROBORATED_CORRELATION: f64 = 0.6;
+/// TTFT correlation that counts as corroboration.
+pub const TTFT_CORRELATION: f64 = 0.8;
 
-/// Per-region per-minute failure rates (`None` when the region saw no attempts that minute).
+/// Everything domain learning looks at, per region.
+#[derive(Clone, Debug, Default)]
+pub struct Signals {
+    /// Per-minute failure rates.
+    pub failures: BTreeMap<String, Vec<Option<f64>>>,
+    /// Per-minute mean time to first output (ms).
+    pub ttft: BTreeMap<String, Vec<Option<f64>>>,
+    /// The Cloudflare colo the region's egress currently reaches most often.
+    pub colos: BTreeMap<String, String>,
+}
+
+/// Per-region per-minute values (`None` when the region had no value that minute).
 #[derive(Default)]
 pub struct History {
     minutes: VecDeque<i64>,
@@ -53,25 +75,56 @@ impl History {
     }
 }
 
-/// Pearson correlation over minutes where both series have a value, if there are enough.
-pub fn correlation(a: &[Option<f64>], b: &[Option<f64>]) -> Option<f64> {
-    let pairs: Vec<(f64, f64)> = a.iter().zip(b).filter_map(|(x, y)| Some(((*x)?, (*y)?))).collect();
+fn pairs(a: &[Option<f64>], b: &[Option<f64>]) -> Vec<(f64, f64)> {
+    a.iter().zip(b).filter_map(|(x, y)| Some(((*x)?, (*y)?))).collect()
+}
+
+fn pearson(pairs: &[(f64, f64)]) -> Option<f64> {
     if pairs.len() < MIN_SHARED {
-        return None;
-    }
-    let episodes = |pick: fn(&(f64, f64)) -> f64| pairs.iter().filter(|p| pick(p) >= EPISODE_RATE).count();
-    if episodes(|p| p.0) < MIN_EPISODE_MINUTES || episodes(|p| p.1) < MIN_EPISODE_MINUTES {
         return None;
     }
     let n = pairs.len() as f64;
     let (mx, my) = (pairs.iter().map(|p| p.0).sum::<f64>() / n, pairs.iter().map(|p| p.1).sum::<f64>() / n);
     let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
-    for (x, y) in &pairs {
+    for (x, y) in pairs {
         sxy += (x - mx) * (y - my);
         sxx += (x - mx).powi(2);
         syy += (y - my).powi(2);
     }
     (sxx > 0.0 && syy > 0.0).then(|| sxy / (sxx * syy).sqrt())
+}
+
+/// Pearson correlation of failure rates over minutes where both series have a value, if there
+/// are enough shared minutes and each region had enough failure episodes.
+pub fn correlation(a: &[Option<f64>], b: &[Option<f64>]) -> Option<f64> {
+    let pairs = pairs(a, b);
+    let episodes = |pick: fn(&(f64, f64)) -> f64| pairs.iter().filter(|p| pick(p) >= EPISODE_RATE).count();
+    if episodes(|p| p.0) < MIN_EPISODE_MINUTES || episodes(|p| p.1) < MIN_EPISODE_MINUTES {
+        return None;
+    }
+    pearson(&pairs)
+}
+
+/// Pearson correlation of TTFT series over shared minutes, if there are enough.
+pub fn ttft_correlation(a: &[Option<f64>], b: &[Option<f64>]) -> Option<f64> {
+    pearson(&pairs(a, b))
+}
+
+/// Whether learning merges regions `a` and `b`.
+pub fn same_pool(signals: &Signals, a: &str, b: &str) -> bool {
+    let series = |m: &BTreeMap<String, Vec<Option<f64>>>, a: &str, b: &str| Some((m.get(a)?.clone(), m.get(b)?.clone()));
+    let Some(failure) = series(&signals.failures, a, b).and_then(|(x, y)| correlation(&x, &y)) else {
+        return false;
+    };
+    if failure >= MERGE_CORRELATION {
+        return true;
+    }
+    if failure < CORROBORATED_CORRELATION {
+        return false;
+    }
+    let colo = matches!((signals.colos.get(a), signals.colos.get(b)), (Some(x), Some(y)) if x == y);
+    let ttft = series(&signals.ttft, a, b).and_then(|(x, y)| ttft_correlation(&x, &y)).is_some_and(|c| c >= TTFT_CORRELATION);
+    colo || ttft
 }
 
 fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
@@ -94,10 +147,14 @@ fn union(parent: &mut BTreeMap<String, String>, a: &str, b: &str) {
 
 /// @cc [owner:ghuntley,label:routing] failure-domains-only-merge
 /// `assign` MUST put two regions in the same domain whenever the operator gave them the same
-/// `failure_domain`, MUST additionally merge regions whose `correlation` is at least 0.8 when
-/// `learn` is set, and MUST name each domain by the smallest configured domain label (or region
-/// name, for regions without one) among its members. It MUST NOT treat region names specially.
-pub fn assign(regions: &[RegionConfig], history: &BTreeMap<String, Vec<Option<f64>>>, learn: bool) -> BTreeMap<String, String> {
+/// `failure_domain`, MUST additionally merge regions for which `same_pool` holds when `learn` is
+/// set (failure correlation at least `MERGE_CORRELATION`, or at least
+/// `CORROBORATED_CORRELATION` with a shared colo or TTFT correlation at least
+/// `TTFT_CORRELATION`), and MUST name each domain by the smallest configured domain label (or
+/// region name, for regions without one) among its members. It MUST NOT treat region names
+/// specially.
+pub fn assign(regions: &[RegionConfig], signals: &Signals, learn: bool) -> BTreeMap<String, String> {
+    let history = &signals.failures;
     let label = |r: &RegionConfig| r.failure_domain.clone().unwrap_or_else(|| r.name.clone());
     let mut names: Vec<String> = regions.iter().map(|r| r.name.clone()).collect();
     for name in history.keys() {
@@ -121,10 +178,9 @@ pub fn assign(regions: &[RegionConfig], history: &BTreeMap<String, Vec<Option<f6
     if learn {
         for (i, a) in names.iter().enumerate() {
             for b in &names[i + 1..] {
-                if let (Some(sa), Some(sb)) = (history.get(a), history.get(b))
-                    && correlation(sa, sb).is_some_and(|c| c >= MERGE_CORRELATION) {
-                        union(&mut parent, a, b);
-                    }
+                if same_pool(signals, a, b) {
+                    union(&mut parent, a, b);
+                }
             }
         }
     }
@@ -157,7 +213,7 @@ mod tests {
 
     #[test]
     fn configured_groups() {
-        let d = assign(&[r("a", Some("p")), r("b", Some("p")), r("c", None)], &BTreeMap::new(), true);
+        let d = assign(&[r("a", Some("p")), r("b", Some("p")), r("c", None)], &Signals::default(), true);
         assert_eq!(d["a"], "p");
         assert_eq!(d["b"], "p");
         assert_eq!(d["c"], "c");
@@ -172,12 +228,53 @@ mod tests {
         h.insert("b".to_string(), wave);
         h.insert("c".to_string(), anti);
         let regions = [r("a", None), r("b", None), r("c", None)];
-        let d = assign(&regions, &h, true);
+        let signals = Signals { failures: h, ..Default::default() };
+        let d = assign(&regions, &signals, true);
         assert_eq!(d["a"], "a");
         assert_eq!(d["b"], "a");
         assert_eq!(d["c"], "c");
-        let d = assign(&regions, &h, false);
+        let d = assign(&regions, &signals, false);
         assert_eq!(d["b"], "b");
+    }
+
+    /// Two failure series that agree on the waves but disagree on noise: correlation in
+    /// [0.6, 0.8), so they merge only with corroboration.
+    fn weakly_correlated() -> (Vec<Option<f64>>, Vec<Option<f64>>) {
+        let a: Vec<Option<f64>> = (0..60).map(|i| Some(if (i / 10) % 2 == 0 { 0.5 } else { 0.0 })).collect();
+        let b: Vec<Option<f64>> = (0..60).map(|i| Some(if (i / 10) % 2 == 0 { 0.5 } else { 0.0 } + if i % 2 == 0 { 0.5 } else { 0.0 })).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn weak_failure_correlation_needs_a_colo_or_ttft_to_merge() {
+        let (a, b) = weakly_correlated();
+        let c = correlation(&a, &b).unwrap();
+        assert!((CORROBORATED_CORRELATION..MERGE_CORRELATION).contains(&c), "fixture correlation {c}");
+        let mut signals = Signals::default();
+        signals.failures.insert("a".into(), a.clone());
+        signals.failures.insert("b".into(), b);
+        assert!(!same_pool(&signals, "a", "b"));
+
+        let mut with_colo = signals.clone();
+        with_colo.colos.insert("a".into(), "DFW".into());
+        with_colo.colos.insert("b".into(), "DFW".into());
+        assert!(same_pool(&with_colo, "a", "b"));
+        with_colo.colos.insert("b".into(), "FRA".into());
+        assert!(!same_pool(&with_colo, "a", "b"));
+
+        let mut with_ttft = signals.clone();
+        let ttft: Vec<Option<f64>> = a.iter().map(|v| v.map(|x| 800.0 + 4000.0 * x)).collect();
+        with_ttft.ttft.insert("a".into(), ttft.clone());
+        with_ttft.ttft.insert("b".into(), ttft);
+        assert!(same_pool(&with_ttft, "a", "b"));
+    }
+
+    #[test]
+    fn a_shared_colo_alone_never_merges() {
+        let mut signals = Signals::default();
+        signals.colos.insert("a".into(), "DFW".into());
+        signals.colos.insert("b".into(), "DFW".into());
+        assert!(!same_pool(&signals, "a", "b"));
     }
 
     #[test]

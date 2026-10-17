@@ -209,9 +209,20 @@ pub async fn ingress(State(state): State<Arc<AppState>>, req: Request) -> Respon
         };
         let status = response.status();
         record.status = status.as_u16();
-        record.cf_colo = relay::cf_colo(response.headers()).or_else(|| {
-            response.headers().get(state::COLO_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string)
-        });
+        match &target {
+            Target::Local => {
+                record.cf_colo = relay::cf_colo(response.headers());
+                state.note_egress_colo(record.cf_colo.as_deref());
+            }
+            Target::Peer { .. } => {
+                record.cf_colo = response.headers().get(state::COLO_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
+                record.hop_ms = response
+                    .headers()
+                    .get(state::HEADERS_MS_HEADER)
+                    .and_then(|v| v.to_str().ok()?.parse::<i64>().ok())
+                    .map(|peer_ms| (started.elapsed().as_millis() as i64 - peer_ms).max(0));
+            }
+        }
         let resp_headers = relay::response_headers(response.headers());
 
         if !status.is_success() {

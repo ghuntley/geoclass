@@ -170,7 +170,11 @@ in
     tailscaleSocket = mkOption {
       type = types.str;
       default = "/run/tailscale/tailscaled.sock";
-      description = "Path of the tailscaled LocalAPI socket.";
+      description = ''
+        Path of the tailscaled LocalAPI socket. tailscaled creates it world-connectable and lets
+        non-root callers make the read-only calls GeoClass needs (status and whois), so the
+        DynamicUser service needs no extra group.
+      '';
     };
 
     staticPeers = mkOption {

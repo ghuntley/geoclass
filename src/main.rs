@@ -11,6 +11,9 @@ struct Cli {
     command: Option<Command>,
     #[arg(long, value_enum, default_value = "auto", global = true)]
     log_format: logging::LogFormat,
+    /// config file (default: $GEOCLASS_CONFIG, else ~/.config/geoclass/config.toml)
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -40,6 +43,10 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(path) = &cli.config {
+        // SAFETY: still single-threaded; nothing has read the environment concurrently yet.
+        unsafe { std::env::set_var("GEOCLASS_CONFIG", path) };
+    }
     if matches!(cli.command, None | Some(Command::Serve { .. })) {
         logging::init(cli.log_format);
     }
@@ -61,7 +68,7 @@ fn check_config(region: Option<String>) -> Result<(), String> {
     let now = geoclass::now_ms();
     println!("node {} in region {} ({})", cfg.node_id, cfg.region, cfg.config_path.display());
     println!("discovery {:?}, upstream {}, mesh {}, ingress {}", cfg.discovery, cfg.upstream, cfg.mesh_bind, cfg.ingress_bind);
-    let domains = geoclass::domains::assign(&cfg.regions, &Default::default(), false);
+    let domains = geoclass::domains::assign(&cfg.regions, &geoclass::domains::Signals::default(), false);
     for r in &cfg.regions {
         let day = now - now.rem_euclid(geoclass::stats::DAY_MS);
         let hours: Vec<String> = (0..24)

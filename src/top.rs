@@ -207,7 +207,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, snapshot: Option<&MonitorSnapshot>, 
             Cell::from(format!("{:.2}", r.weight)),
             Cell::from(r.attempts.to_string()),
             Cell::from(format!("{:.1}%", r.rate * 100.0)),
-            Cell::from(ms(r.ttft_mean_ms)),
+            Cell::from(format!("{}/{}", ms(r.ttft_p50_ms), ms(r.ttft_p95_ms))),
             Cell::from(r.bindings.to_string()),
             Cell::from(r.inflight.to_string()),
         ])
@@ -220,11 +220,11 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, snapshot: Option<&MonitorSnapshot>, 
         Constraint::Length(7),
         Constraint::Length(8),
         Constraint::Length(7),
-        Constraint::Length(8),
+        Constraint::Length(15),
         Constraint::Length(9),
         Constraint::Length(6),
     ])
-    .header(Row::new(["region", "state", "domain", "up", "weight", "attempts", "fail", "ttft", "sessions", "live"]).style(Style::default().fg(MUTED)))
+    .header(Row::new(["region", "state", "domain", "up", "weight", "attempts", "fail", "ttft p50/p95", "sessions", "live"]).style(Style::default().fg(MUTED)))
     .block(panel(" regions (5 min window) "));
     frame.render_widget(table, chunks[1]);
 

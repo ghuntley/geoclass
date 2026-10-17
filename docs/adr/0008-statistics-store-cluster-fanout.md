@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. Latency reporting is amended by [0011](0011-mergeable-latency-histograms.md).
 
 ## Context
 

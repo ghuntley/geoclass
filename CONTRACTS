@@ -5,7 +5,7 @@ Request and response headers (including `Authorization` and `x-geoclass-mesh-key
 GeoClass MUST forward the client's credentials to the upstream unchanged and MUST NOT store them; it MUST strip every `x-geoclass-*` header (so the mesh key never leaves the mesh) and hop-by-hop headers before egress.
 
 @cc [owner:ghuntley,label:architecture] pure-sync-core
-`src/placement.rs`, `src/health.rs`, `src/bindings.rs`, `src/domains.rs`, `src/prior.rs`, `src/gate.rs`, `src/sse.rs`, and `src/stats.rs` MUST remain pure and synchronous: no tokio, no I/O, no wall-clock access — time enters as a parameter. Property tests in `tests/properties.rs` depend on this.
+`src/placement.rs`, `src/health.rs`, `src/hist.rs`, `src/bindings.rs`, `src/domains.rs`, `src/prior.rs`, `src/gate.rs`, `src/sse.rs`, and `src/stats.rs` MUST remain pure and synchronous: no tokio, no I/O, no wall-clock access — time enters as a parameter. Property tests in `tests/properties.rs` depend on this.
 
 @cc [owner:ghuntley,label:proxy] retry-only-before-output
 An attempt MAY be retried in another region only before any model output has been released to the client, and only for a capacity error code, a 5xx, or a transport failure. Account-scoped errors (429 quota, 401, 403) and every committed stream MUST reach the client unchanged.

@@ -23,6 +23,13 @@ pub struct MonitorRegion {
     pub errors: i64,
     pub rate: f64,
     pub ttft_mean_ms: Option<i64>,
+    #[serde(default)]
+    pub ttft_p50_ms: Option<i64>,
+    #[serde(default)]
+    pub ttft_p95_ms: Option<i64>,
+    /// The Cloudflare colo the region's egress reaches most often (a failure-domain signal).
+    #[serde(default)]
+    pub colo: Option<String>,
     pub bindings: i64,
     pub inflight: i64,
     /// Per-model states that differ from green.
@@ -74,6 +81,7 @@ pub fn build(state: &AppState, now: i64) -> MonitorSnapshot {
     let (regions, bindings_total) = {
         let mesh = state.mesh.lock().unwrap();
         let counts = mesh.bindings.as_ref().map(|b| b.counts_by_region(now)).unwrap_or_default();
+        let colos = state.region_colos(&mesh, now);
         let regions = state
             .region_names(&mesh, now)
             .into_iter()
@@ -99,6 +107,9 @@ pub fn build(state: &AppState, now: i64) -> MonitorSnapshot {
                     errors: c.errors,
                     rate: c.rate(),
                     ttft_mean_ms: (c.ttft_n > 0).then(|| c.ttft_sum_ms / c.ttft_n),
+                    ttft_p50_ms: c.ttft_hist.p50(),
+                    ttft_p95_ms: c.ttft_hist.p95(),
+                    colo: colos.get(&name).cloned(),
                     bindings: counts.get(&name).copied().unwrap_or(0),
                     inflight: inflight_by_region.get(&name).copied().unwrap_or(0),
                     models,

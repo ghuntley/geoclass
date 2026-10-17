@@ -82,7 +82,7 @@ That's it. Nodes find each other through the tailnet, and underclass needs no co
   - A red region with no new failures goes green once its window empties, so traffic probes it again.
 - **Failure domains.** Two egress regions may share one upstream serving pool, in which case retrying from one to the other is pointless.
   - **Configured:** you can group them with `failure_domain`.
-  - **Learned:** regions whose per-minute failure rates correlate at 0.8 or more over at least 30 minutes are merged automatically.
+  - **Learned:** regions whose per-minute failure rates correlate at 0.8 or more over at least 30 minutes are merged automatically. A weaker correlation (0.6 or more) also merges them when it is corroborated: either their time to first output rises and falls together, or their egress reaches the same Cloudflare colo. A shared colo or correlated TTFT never merges regions on its own ([0010](docs/adr/0010-corroborated-failure-domain-learning.md)).
 - **Chase the sun.** New sessions favour regions whose working day is over.
   - **Configured weights:** each region gets 24 UTC hourly weights (and optionally weekend ones), or a simpler `utc_offset_hours` + `peak_hours` + `peak_weight`.
   - **Learned weights:** each node also learns an hour-of-week failure rate per region and blends it in (`learned_prior_weight`).
@@ -101,11 +101,11 @@ Design decisions and their trade-offs live in [`docs/adr/`](docs/adr). Start wit
 
 Capacity errors are regional by OpenAI's own account. A Codex maintainer reportedly described `server_is_overloaded` as low capacity "in your region" ([laozhang](https://blog.laozhang.ai/en/posts/codex-selected-model-at-capacity.md)), and OpenAI has moved traffic between regions by hand during incidents ([write-up](https://status.openai.com/incidents/01KXXDNEAKEPRGFM661SBJJAM6/write-up)). There is no public map from client egress to serving cluster; chatgpt.com sits behind Cloudflare anycast.
 
-**None of this is authoritative.** GeoClass records the Cloudflare colo (`cf-ray`) and the failure domain of every attempt, so `geoclass stats --by region` shows what your egress actually gets.
+**None of this is authoritative.** GeoClass records the Cloudflare colo (`cf-ray`) and the failure domain of every attempt, so `geoclass stats --by region` shows what your egress actually gets. Each region's current colo also appears next to its domain in `gtop` and the web UI.
 
 ## Configuration
 
-Use `~/.config/geoclass/config.toml` (or `GEOCLASS_CONFIG`). [`examples/geoclass.toml`](examples/geoclass.toml) is a complete three-region example; validate one with `geoclass check-config`.
+Use `~/.config/geoclass/config.toml`, or point at another file with `--config` or `GEOCLASS_CONFIG`. [`examples/geoclass.toml`](examples/geoclass.toml) is a complete three-region example; validate one with `geoclass check-config`.
 
 | key | default | meaning |
 |---|---|---|
@@ -151,30 +151,32 @@ Below is real output from a two-node smoke test with local mock upstreams. Regio
 
 ```
 $ geoclass stats --since 1h --by region
-2026-10-17 06:00 → 2026-10-17 07:28 UTC · hour buckets · scope cluster · 2 node(s)
-                     requests attempts retried rescued  rescue   cache    tokens in tokens out     ttft  peak   mean  events
-2026-10-17 07:00            2        3       1       1  100.0%   80.0%          200         10      2ms     1   0.00
-total                       2        3       1       1  100.0%   80.0%          200         10      2ms     1   0.00
-cache hit: stayed 80.0% · moved –   gate hold mean 0ms   gates {"output": 2, "retried": 1}
+2026-10-17 06:00 → 2026-10-17 07:50 UTC · hour buckets · scope cluster · 2 node(s)
+                     requests attempts retried rescued  rescue   cache    tokens in tokens out  ttft p50/p95  peak   mean  events
+2026-10-17 07:00            2        3       1       1  100.0%   80.0%          200         10         5ms/5ms     1   0.00
+total                       2        3       1       1  100.0%   80.0%          200         10         5ms/5ms     1   0.00
+cache hit: stayed 80.0% · moved –   gates {"output": 2, "retried": 1}
+latency p50/p95/mean: ttft 5ms/5ms/2ms · gate hold 5ms/5ms/0ms · relay hop 5ms/5ms/1ms
 
 by region
-                     requests attempts retried rescued  rescue   cache    tokens in tokens out     ttft  peak   mean  events
-alpha                       1        1       1       0    0.0%       –            0          0        –     1   0.00
-beta                        2        2       0       1       –   80.0%          200         10      2ms     1   0.00
+                     requests attempts retried rescued  rescue   cache    tokens in tokens out  ttft p50/p95  peak   mean  events
+alpha                       1        1       1       0    0.0%       –            0          0             –/–     1   0.00
+beta                        2        2       0       1       –   80.0%          200         10         5ms/5ms     1   0.00
 
 relayed for other regions
-  from alpha          requests        2 errors      0 mean      1ms to-headers      1ms
+  from alpha          requests        2 errors      0 mean      1ms to-headers p50/p95/mean 5ms/5ms/0ms
 
 requests and sessions are summed across nodes (upper bounds)
 ```
 
 - **Rescue rate:** requests that hit a capacity failure and were then served from another region, divided by requests that hit one. This is the headline number.
 - **Cache hit (stayed vs moved):** what a move costs.
+- **Latency** is reported as p50/p95/mean for time to first output, time held in the gate, and the relay hop: the time a peer adds, measured as this node's time to headers minus the peer's. Percentiles come from fixed buckets (5 ms up to 60 s), so each one is the upper bound of its bucket, which is why a fast local test reads `5ms`. Histograms add up across nodes, so cluster-scope percentiles are exact to the bucket ([0011](docs/adr/0011-mergeable-latency-histograms.md)).
 - **`--scope cluster`** (the default) asks every live peer for the same window and merges the answers. Request and session counts are then summed and flagged as upper bounds. `--scope local` reports this node only.
 - **`--by`** takes `total`, `region`, `ingress`, `model`, `region_model`, `account`, or `domain`; **`--bucket`** takes `minute`, `hour`, or `day`; **`--json`** prints the raw response.
 
 `geoclass top` (`gtop` from the Nix package) is a live terminal view showing:
-- region states, weights, and failure rates;
+- region states, weights, failure rates, TTFT p50/p95, and colo;
 - live peers and how old their gossip is;
 - attempts and retries per minute;
 - recent attempts.
@@ -184,8 +186,8 @@ Locally it reads `/run/geoclass/monitor.sock` without a token. The web UI at `/`
 ## CLI
 
 ```
-geoclass serve [--region NAME] [--log-format auto|json|pretty]
-geoclass check-config [--region NAME]
+geoclass serve [--region NAME] [--config FILE] [--log-format auto|json|pretty]
+geoclass check-config [--region NAME] [--config FILE]
 geoclass stats [--since 24h|7d|2y] [--bucket minute|hour|day] [--by …] [--scope cluster|local] [--json] [--url ORIGIN]
 geoclass top [--url ORIGIN]
 ```

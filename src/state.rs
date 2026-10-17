@@ -9,7 +9,10 @@ use crate::placement::RegionView;
 use crate::prior::{self, LearnedPrior};
 use crate::store::{Event, HealthSample, Store};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Egress colos remembered for `NodeInfo::colo`.
+const COLO_MEMORY: usize = 64;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +35,9 @@ pub struct NodeInfo {
     pub version: String,
     /// Whether this node can currently egress to the upstream.
     pub egress_ok: bool,
+    /// The Cloudflare colo this node's egress reaches most often lately.
+    #[serde(default)]
+    pub colo: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,6 +82,9 @@ pub struct Mesh {
     pub bindings: Option<Bindings>,
     pub learned: LearnedPrior,
     pub history: domains::History,
+    pub ttft_history: domains::History,
+    /// Colos this node's own egress reached, most recent last.
+    pub colos: VecDeque<String>,
     pub domains: BTreeMap<String, String>,
     pub last_minute: i64,
     pub last_weights: BTreeMap<String, f64>,
@@ -119,7 +128,7 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         let mesh = Mesh {
             bindings: Some(Bindings::new(cfg.binding_cap, cfg.binding_ttl_ms)),
-            domains: domains::assign(&cfg.regions, &BTreeMap::new(), false),
+            domains: domains::assign(&cfg.regions, &domains::Signals::default(), false),
             egress_ok: true,
             ..Default::default()
         };
@@ -145,7 +154,34 @@ impl AppState {
             region: self.cfg.region.clone(),
             version: VERSION.to_string(),
             egress_ok: mesh.egress_ok,
+            colo: dominant(&mesh.colos),
         }
+    }
+
+    /// Remembers the colo this node's own egress just reached.
+    pub fn note_egress_colo(&self, colo: Option<&str>) {
+        let Some(colo) = colo else { return };
+        let mut mesh = self.mesh.lock().unwrap();
+        mesh.colos.push_back(colo.to_string());
+        while mesh.colos.len() > COLO_MEMORY {
+            mesh.colos.pop_front();
+        }
+    }
+
+    /// Each region's colo: the most common `NodeInfo::colo` among this node (for its own region)
+    /// and the live peers in that region.
+    pub fn region_colos(&self, mesh: &Mesh, now: i64) -> BTreeMap<String, String> {
+        let mut seen: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
+        if let Some(colo) = dominant(&mesh.colos) {
+            seen.entry(self.cfg.region.clone()).or_default().push_back(colo);
+        }
+        for peer in mesh.peers.values().filter(|p| self.is_live(p, now)) {
+            if let Some(info) = &peer.info
+                && let Some(colo) = &info.colo {
+                    seen.entry(info.region.clone()).or_default().push_back(colo.clone());
+                }
+        }
+        seen.into_iter().filter_map(|(region, colos)| Some((region, dominant(&colos)?))).collect()
     }
 
     pub fn stale_after_ms(&self) -> i64 {
@@ -339,6 +375,7 @@ impl AppState {
             mesh.last_minute = minute;
             let regions = self.region_names(&mesh, now);
             let mut rates: BTreeMap<String, Option<f64>> = BTreeMap::new();
+            let mut ttft: BTreeMap<String, Option<f64>> = BTreeMap::new();
             for region in &regions {
                 let counts = mesh.health.counts(region, ALL_MODELS);
                 let rate = (counts.attempts > 0).then(|| counts.rate());
@@ -346,9 +383,16 @@ impl AppState {
                     mesh.learned.observe(region, rate, now);
                 }
                 rates.insert(region.clone(), rate);
+                ttft.insert(region.clone(), (counts.ttft_n > 0).then(|| counts.ttft_sum_ms as f64 / counts.ttft_n as f64));
             }
             mesh.history.record(minute, &rates);
-            let assigned = domains::assign(&self.cfg.regions, &mesh.history.series(), self.cfg.domain_learning);
+            mesh.ttft_history.record(minute, &ttft);
+            let signals = domains::Signals {
+                failures: mesh.history.series(),
+                ttft: mesh.ttft_history.series(),
+                colos: self.region_colos(&mesh, now),
+            };
+            let assigned = domains::assign(&self.cfg.regions, &signals, self.cfg.domain_learning);
             for (region, domain) in &assigned {
                 if mesh.domains.get(region).is_some_and(|old| old != domain) {
                     events.push(self.event("domain_changed", |e| {
@@ -382,6 +426,8 @@ impl AppState {
                     state: mesh.health.state(&region, &model).as_str().to_string(),
                     weight: self.weight(&mesh, &region, now),
                     ttft_mean_ms: (counts.ttft_n > 0).then(|| counts.ttft_sum_ms / counts.ttft_n),
+                    ttft_p50_ms: counts.ttft_hist.p50(),
+                    ttft_p95_ms: counts.ttft_hist.p95(),
                     region,
                     model,
                 });
@@ -413,6 +459,17 @@ impl AppState {
             by.remove(region);
         }
     }
+}
+
+/// The most common entry; ties go to the one seen most recently.
+pub fn dominant(items: &VecDeque<String>) -> Option<String> {
+    let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (i, item) in items.iter().enumerate() {
+        let e = counts.entry(item.as_str()).or_default();
+        e.0 += 1;
+        e.1 = i;
+    }
+    counts.into_iter().max_by_key(|(_, (n, last))| (*n, *last)).map(|(k, _)| k.to_string())
 }
 
 /// Decrements in-flight counters exactly once when dropped.

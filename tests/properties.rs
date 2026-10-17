@@ -1,6 +1,9 @@
-//! Hegel property tests over the pure core: placement, the gate, bindings, health, and stats.
+//! Hegel property tests over the pure core: placement, the gate, bindings, health, domains,
+//! latency histograms, and stats.
 use geoclass::bindings::{BindingRecord, Bindings};
-use geoclass::config::Thresholds;
+use geoclass::config::{RegionConfig, Thresholds};
+use geoclass::domains::{self, Signals};
+use geoclass::hist::{self, Hist};
 use geoclass::gate::{Gate, Verdict};
 use geoclass::health::{Counts, State, next_state};
 use geoclass::placement::{self, Reason, RegionView, Request};
@@ -292,6 +295,9 @@ fn test_cluster_merge_matches_a_single_node_with_every_row(tc: TestCase) {
             output_tokens: Some(1),
             rescued: *gate == 0 && tokens % 2 == 0,
             overload_hit: *gate == 1,
+            ttft_ms: (*gate == 0).then_some(*tokens as i64 * 97),
+            held_ms: Some(*tokens as i64 * 13),
+            hop_ms: (node != region).then_some(*tokens as i64 * 7),
             ..Default::default()
         };
         nodes[*node as usize].insert_attempt(&record).unwrap();
@@ -316,4 +322,82 @@ fn test_cluster_merge_matches_a_single_node_with_every_row(tc: TestCase) {
         assert_eq!(m.key, s.key);
         assert_eq!(strip(&m.totals), strip(&s.totals));
     }
+}
+
+#[hegel::test]
+fn test_histograms_merge_by_addition_and_percentiles_bound_their_rank(tc: TestCase) {
+    let values: Vec<i64> = tc.draw(gs::vecs(gs::integers::<i64>().min_value(-10).max_value(200_000)).max_size(60));
+    let split = tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len()));
+    let (mut all, mut left, mut right) = (Hist::default(), Hist::default(), Hist::default());
+    for (i, v) in values.iter().enumerate() {
+        all.record(*v);
+        if i < split { left.record(*v) } else { right.record(*v) }
+    }
+    left.add(&right);
+    assert_eq!(left, all);
+    assert_eq!(all.count(), values.len() as i64);
+    let (q1, q2) = (
+        tc.draw(gs::floats::<f64>().min_value(0.0).max_value(1.0).allow_nan(false)),
+        tc.draw(gs::floats::<f64>().min_value(0.0).max_value(1.0).allow_nan(false)),
+    );
+    let (lo, hi) = if q1 <= q2 { (q1, q2) } else { (q2, q1) };
+    match (all.percentile(lo), all.percentile(hi)) {
+        (None, None) => assert!(values.is_empty()),
+        (Some(a), Some(b)) => {
+            assert!(a <= b, "percentile must be monotone");
+            let rank = ((hi * values.len() as f64).ceil() as usize).max(1);
+            let last = *hist::BOUNDS_MS.last().unwrap();
+            if b < last {
+                assert!(values.iter().filter(|v| **v <= b).count() >= rank, "p{hi} = {b} must cover its rank");
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[hegel::test]
+fn test_domain_learning_only_merges_and_ignores_region_order(tc: TestCase) {
+    let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(NAMES.len()));
+    let regions: Vec<RegionConfig> = (0..n)
+        .map(|i| RegionConfig {
+            name: NAMES[i].to_string(),
+            failure_domain: tc.draw(gs::sampled_from(vec![None, Some("p"), Some("q")])).map(str::to_string),
+            ..Default::default()
+        })
+        .collect();
+    // A few shapes so learning actually fires: two waves (in and out of phase), noise, and gaps.
+    let shape = |kind: u8, i: usize| -> Option<f64> {
+        match kind {
+            0 => Some(if (i / 10).is_multiple_of(2) { 0.5 } else { 0.0 }),
+            1 => Some(if (i / 10).is_multiple_of(2) { 0.0 } else { 0.5 }),
+            2 => Some(if (i / 10).is_multiple_of(2) { 0.5 } else { 0.0 } + if i.is_multiple_of(2) { 0.5 } else { 0.0 }),
+            _ => (!i.is_multiple_of(4)).then_some(((i * 7) % 5) as f64 / 10.0),
+        }
+    };
+    let mut signals = Signals::default();
+    for r in &regions {
+        let kind = tc.draw(gs::integers::<u8>().min_value(0).max_value(3));
+        signals.failures.insert(r.name.clone(), (0..60).map(|i| shape(kind, i)).collect());
+        let ttft = tc.draw(gs::integers::<u8>().min_value(0).max_value(3));
+        signals.ttft.insert(r.name.clone(), (0..60).map(|i| shape(ttft, i).map(|x| 500.0 + 1000.0 * x)).collect());
+        if let Some(colo) = tc.draw(gs::sampled_from(vec![None, Some("AAA"), Some("BBB")])) {
+            signals.colos.insert(r.name.clone(), colo.to_string());
+        }
+    }
+    let configured = domains::assign(&regions, &signals, false);
+    let learned = domains::assign(&regions, &signals, true);
+    for a in &regions {
+        for b in &regions {
+            if configured[&a.name] == configured[&b.name] {
+                assert_eq!(learned[&a.name], learned[&b.name], "learning split {} and {}", a.name, b.name);
+            }
+            if domains::same_pool(&signals, &a.name, &b.name) {
+                assert_eq!(learned[&a.name], learned[&b.name]);
+            }
+            assert_eq!(domains::same_pool(&signals, &a.name, &b.name), domains::same_pool(&signals, &b.name, &a.name));
+        }
+    }
+    let mut reversed = regions.clone();
+    reversed.reverse();
+    assert_eq!(domains::assign(&reversed, &signals, true), learned);
 }

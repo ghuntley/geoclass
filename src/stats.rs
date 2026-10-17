@@ -3,6 +3,7 @@
 //! The store runs the SQL aggregates (counts, tallies, attempt intervals); this module turns them
 //! into per-bucket series, sweeps attempt intervals for concurrency, and merges finished-day
 //! rollups and other nodes' answers. Synchronous; time is plain `i64` milliseconds.
+use crate::hist::Hist;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -93,6 +94,18 @@ pub struct Totals {
     pub held_sum_ms: i64,
     #[serde(default)]
     pub held_n: i64,
+    /// Time the relay hop added, summed over attempts sent through a peer.
+    #[serde(default)]
+    pub hop_sum_ms: i64,
+    #[serde(default)]
+    pub hop_n: i64,
+    /// Distributions of time to first output, gate hold, and relay hop.
+    #[serde(default)]
+    pub ttft_hist: Hist,
+    #[serde(default)]
+    pub held_hist: Hist,
+    #[serde(default)]
+    pub hop_hist: Hist,
     /// Most upstream attempts in flight at once.
     pub peak_concurrency: i64,
     /// Time-weighted mean of attempts in flight, times 1000.
@@ -141,6 +154,10 @@ impl Totals {
     pub fn mean_held_ms(&self) -> Option<i64> {
         (self.held_n > 0).then(|| self.held_sum_ms / self.held_n)
     }
+
+    pub fn mean_hop_ms(&self) -> Option<i64> {
+        (self.hop_n > 0).then(|| self.hop_sum_ms / self.hop_n)
+    }
 }
 
 /// One SQL aggregate row for a bucket index and series key.
@@ -165,6 +182,19 @@ pub struct CountRow {
     pub ttft_n: i64,
     pub held_sum_ms: i64,
     pub held_n: i64,
+    pub hop_sum_ms: i64,
+    pub hop_n: i64,
+}
+
+/// One latency-histogram bucket count (`index` per `hist::bucket_of`) for a bucket index and
+/// series key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistRow {
+    pub bucket: i64,
+    pub key: String,
+    pub label: String,
+    pub index: usize,
+    pub count: i64,
 }
 
 /// A named count (an outcome or event kind) for a bucket index and series key.
@@ -250,7 +280,7 @@ pub fn concurrency(intervals: &[(i64, i64)], from: i64, to: i64, bucket_ms: i64)
 }
 
 /// @cc [owner:ghuntley,label:accounting] stats-assemble-partition
-/// `assemble` MUST place every count, tally, and interval only in the series named by its key and
+/// `assemble` MUST place every count, tally, histogram row, and interval only in the series named by its key and
 /// in the bucket it reports, MUST emit one bucket per `bucket_count(from, to, bucket_ms)` for every
 /// series that has any row, and MUST order series by key.
 pub fn assemble(
@@ -266,6 +296,18 @@ pub fn assemble(
     for row in counts {
         if let Some(totals) = bucket_mut(&mut series, count, from, bucket_ms, &row.key, &row.label, row.bucket) {
             add_counts(totals, row);
+        }
+    }
+    for (rows, pick) in [
+        (&tallies.ttft, (|t: &mut Totals| &mut t.ttft_hist) as fn(&mut Totals) -> &mut Hist),
+        (&tallies.held, |t: &mut Totals| &mut t.held_hist),
+        (&tallies.hop, |t: &mut Totals| &mut t.hop_hist),
+    ] {
+        for row in rows {
+            if let Some(totals) = bucket_mut(&mut series, count, from, bucket_ms, &row.key, &row.label, row.bucket)
+                && let Some(slot) = pick(totals).0.get_mut(row.index) {
+                    *slot += row.count;
+                }
         }
     }
     for (rows, pick) in [
@@ -294,13 +336,16 @@ pub fn assemble(
     series.into_values().collect()
 }
 
-/// Named-count rows for `assemble`.
+/// Named-count and histogram rows for `assemble`.
 #[derive(Clone, Debug, Default)]
 pub struct Tallies {
     pub outcomes: Vec<TallyRow>,
     pub events: Vec<TallyRow>,
     pub gates: Vec<TallyRow>,
     pub reasons: Vec<TallyRow>,
+    pub ttft: Vec<HistRow>,
+    pub held: Vec<HistRow>,
+    pub hop: Vec<HistRow>,
 }
 
 fn add_counts(totals: &mut Totals, row: &CountRow) {
@@ -320,6 +365,8 @@ fn add_counts(totals: &mut Totals, row: &CountRow) {
     totals.ttft_n += row.ttft_n;
     totals.held_sum_ms += row.held_sum_ms;
     totals.held_n += row.held_n;
+    totals.hop_sum_ms += row.hop_sum_ms;
+    totals.hop_n += row.hop_n;
 }
 
 fn add_maps(into: &mut BTreeMap<String, i64>, from: &BTreeMap<String, i64>) {
@@ -352,7 +399,7 @@ fn bucket_mut<'a>(
 }
 
 /// @cc [owner:ghuntley,label:accounting] stats-combine
-/// `combine` MUST sum every additive field and named count, take the maximum peak, and weight
+/// `combine` MUST sum every additive field, named count, and histogram bucket, take the maximum peak, and weight
 /// mean concurrency by each part's span; a sum of distinct counts (requests, sessions) is an
 /// upper bound that callers MUST replace with an exact distinct count when one is available.
 pub fn combine(parts: &[(&Totals, i64)]) -> Totals {
@@ -376,6 +423,11 @@ pub fn combine(parts: &[(&Totals, i64)]) -> Totals {
         out.ttft_n += totals.ttft_n;
         out.held_sum_ms += totals.held_sum_ms;
         out.held_n += totals.held_n;
+        out.hop_sum_ms += totals.hop_sum_ms;
+        out.hop_n += totals.hop_n;
+        out.ttft_hist.add(&totals.ttft_hist);
+        out.held_hist.add(&totals.held_hist);
+        out.hop_hist.add(&totals.hop_hist);
         out.peak_concurrency = out.peak_concurrency.max(totals.peak_concurrency);
         add_maps(&mut out.outcomes, &totals.outcomes);
         add_maps(&mut out.events, &totals.events);

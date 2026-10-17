@@ -38,7 +38,7 @@ fn events(t: &Totals) -> String {
 
 fn row(label: &str, t: &Totals) -> String {
     format!(
-        "{:<20} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>12} {:>10} {:>8} {:>5} {:>6}  {}",
+        "{:<20} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>12} {:>10} {:>15} {:>5} {:>6}  {}",
         label,
         t.requests,
         t.attempts,
@@ -48,14 +48,14 @@ fn row(label: &str, t: &Totals) -> String {
         pct(t.cache_hit_ratio()),
         t.input_tokens,
         t.output_tokens,
-        ms(t.mean_ttft_ms()),
+        format!("{}/{}", ms(t.ttft_hist.p50()), ms(t.ttft_hist.p95())),
         t.peak_concurrency,
         format!("{:.2}", t.mean_concurrency_milli as f64 / 1000.0),
         events(t)
     )
 }
 
-const HEADER: &str = "                     requests attempts retried rescued  rescue   cache    tokens in tokens out     ttft  peak   mean  events";
+const HEADER: &str = "                     requests attempts retried rescued  rescue   cache    tokens in tokens out  ttft p50/p95  peak   mean  events";
 
 /// Renders a response as the plain-text report.
 pub fn render(r: &StatsResponse) -> String {
@@ -75,12 +75,24 @@ pub fn render(r: &StatsResponse) -> String {
     }
     out.push_str(&row("total", &r.totals));
     out.push('\n');
+    let t = &r.totals;
     out.push_str(&format!(
-        "cache hit: stayed {} · moved {}   gate hold mean {}   gates {:?}\n",
-        pct(r.totals.stayed_cache_hit_ratio()),
-        pct(r.totals.moved_cache_hit_ratio()),
-        ms(r.totals.mean_held_ms()),
-        r.totals.gates
+        "cache hit: stayed {} · moved {}   gates {:?}\n",
+        pct(t.stayed_cache_hit_ratio()),
+        pct(t.moved_cache_hit_ratio()),
+        t.gates
+    ));
+    out.push_str(&format!(
+        "latency p50/p95/mean: ttft {}/{}/{} · gate hold {}/{}/{} · relay hop {}/{}/{}\n",
+        ms(t.ttft_hist.p50()),
+        ms(t.ttft_hist.p95()),
+        ms(t.mean_ttft_ms()),
+        ms(t.held_hist.p50()),
+        ms(t.held_hist.p95()),
+        ms(t.mean_held_ms()),
+        ms(t.hop_hist.p50()),
+        ms(t.hop_hist.p95()),
+        ms(t.mean_hop_ms())
     ));
     if !r.series.is_empty() {
         out.push_str(&format!("\nby {}\n{HEADER}\n", r.by.as_str()));
@@ -94,11 +106,13 @@ pub fn render(r: &StatsResponse) -> String {
         out.push_str("\nrelayed for other regions\n");
         for x in &r.relay {
             out.push_str(&format!(
-                "  from {:<14} requests {:>8} errors {:>6} mean {:>8} to-headers {:>8}\n",
+                "  from {:<14} requests {:>8} errors {:>6} mean {:>8} to-headers p50/p95/mean {}/{}/{}\n",
                 x.from_region,
                 x.requests,
                 x.errors,
                 ms(Some(x.mean_duration_ms)),
+                ms(x.headers_hist.p50()),
+                ms(x.headers_hist.p95()),
                 ms(x.mean_headers_ms)
             ));
         }

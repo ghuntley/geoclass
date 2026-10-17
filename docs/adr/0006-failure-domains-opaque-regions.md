@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. The learning rule is amended by [0010](0010-corroborated-failure-domain-learning.md).
 
 ## Context
 

@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod domains;
 pub mod gate;
 pub mod health;
+pub mod hist;
 pub mod ingress;
 pub mod logging;
 pub mod mesh;

@@ -5,6 +5,7 @@
 //! `(region, model)` — and each region across all models (`ALL_MODELS`) — gets a green/amber/red
 //! state with hysteresis. Pure and synchronous; time is a parameter.
 use crate::config::Thresholds;
+use crate::hist::Hist;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -22,6 +23,9 @@ pub struct Counts {
     /// Sum and count of time-to-first-output for committed attempts (ms).
     pub ttft_sum_ms: i64,
     pub ttft_n: i64,
+    /// Time-to-first-output distribution for committed attempts.
+    #[serde(default)]
+    pub ttft_hist: Hist,
 }
 
 impl Counts {
@@ -31,6 +35,7 @@ impl Counts {
         self.errors += other.errors;
         self.ttft_sum_ms += other.ttft_sum_ms;
         self.ttft_n += other.ttft_n;
+        self.ttft_hist.add(&other.ttft_hist);
     }
 
     pub fn failures(&self) -> i64 {
@@ -82,6 +87,7 @@ impl LocalWindow {
                     if let Some(ttft) = ttft_ms {
                         counts.ttft_sum_ms += ttft.max(0);
                         counts.ttft_n += 1;
+                        counts.ttft_hist.record(ttft);
                     }
                 }
                 Observation::Overloaded => counts.overloaded += 1,
@@ -254,6 +260,7 @@ mod tests {
         let sums = w.sums(5_000, 60_000);
         let m = sums.iter().find(|s| s.model == "m").unwrap();
         assert_eq!((m.counts.attempts, m.counts.overloaded, m.counts.ttft_n), (2, 1, 1));
+        assert_eq!(m.counts.ttft_hist.p50(), Some(50));
         assert!(sums.iter().any(|s| s.model == ALL_MODELS));
         assert!(w.sums(120_000, 60_000).is_empty());
         let other = vec![WindowCount { region: "a".into(), model: "m".into(), counts: c(3, 0) }];

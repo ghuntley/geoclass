@@ -48,7 +48,7 @@
     <section class="card">
       <h2>Regions</h2>
       <div class="wrap"><table id="regions"><thead><tr>
-        <th>region</th><th>state</th><th>domain</th><th>available</th><th>weight</th><th>window attempts</th><th>overloaded</th><th>errors</th><th>rate</th><th>ttft</th><th>sessions</th><th>in flight</th>
+        <th>region</th><th>state</th><th>domain</th><th>available</th><th>weight</th><th>window attempts</th><th>overloaded</th><th>errors</th><th>rate</th><th>ttft p50 / p95</th><th>sessions</th><th>in flight</th>
       </tr></thead><tbody></tbody></table></div>
       <div id="bins"></div>
     </section>
@@ -108,6 +108,17 @@ async function api(path) {
   return r.json();
 }
 
+// Histogram percentile; mirrors hist::Hist::percentile using the bounds the server sends.
+let bounds = [];
+function pctl(h, q) {
+  const n = (h || []).reduce((a, b) => a + b, 0);
+  if (!n || !bounds.length) return null;
+  const rank = Math.max(1, Math.ceil(q * n));
+  let seen = 0;
+  for (let i = 0; i < h.length; i++) { seen += h[i]; if (seen >= rank) return bounds[Math.min(i, bounds.length - 1)]; }
+  return bounds[bounds.length - 1];
+}
+
 function badge(state) { return `<span class="badge ${esc(state)}">${esc(state)}</span>`; }
 
 async function loadMonitor() {
@@ -116,10 +127,10 @@ async function loadMonitor() {
   $('regions').tBodies[0].innerHTML = m.regions.map((r) => `<tr>
     <td>${esc(r.name)}${r.local ? ' <span class="muted">(local)</span>' : ''}</td>
     <td>${badge(r.state)} ${Object.entries(r.models || {}).map(([k, v]) => `<span class="muted">${esc(k)}</span> ${badge(v)}`).join(' ')}</td>
-    <td>${esc(r.domain)}</td><td>${r.available ? 'yes' : '<span class="badge off">no</span>'}</td>
+    <td>${esc(r.domain)}${r.colo ? ` <span class="muted">${esc(r.colo)}</span>` : ''}</td><td>${r.available ? 'yes' : '<span class="badge off">no</span>'}</td>
     <td>${r.weight.toFixed(2)} <span class="muted">(cfg ${r.configured_weight.toFixed(2)})</span></td>
     <td>${num(r.attempts)}</td><td>${num(r.overloaded)}</td><td>${num(r.errors)}</td><td>${pct(r.rate)}</td>
-    <td>${ms(r.ttft_mean_ms)}</td><td>${num(r.bindings)}</td><td>${num(r.inflight)}</td></tr>`).join('');
+    <td>${ms(r.ttft_p50_ms)} / ${ms(r.ttft_p95_ms)}</td><td>${num(r.bindings)}</td><td>${num(r.inflight)}</td></tr>`).join('');
   $('bins').innerHTML = Object.entries(m.minute_bins).map(([region, bins]) => {
     const max = Math.max(1, ...bins.map((b) => b[0]));
     return `<div class="muted">${esc(region)} — last 60 min (green served, red retried away)</div><div class="strip">${bins.map(([a, r]) =>
@@ -146,7 +157,9 @@ function tiles(t) {
     ['rescue rate', pct(rescue)], ['overload hits', num(t.overload_hit)], ['retried attempts', num(t.retried)],
     ['cache hit', pct(cache)], ['cache hit (stayed)', pct(stayed)], ['cache hit (moved)', pct(moved)],
     ['tokens in / out', num(t.input_tokens) + ' / ' + num(t.output_tokens)],
-    ['mean ttft', ms(t.ttft_n ? Math.round(t.ttft_sum_ms / t.ttft_n) : null)], ['mean gate hold', ms(t.held_n ? Math.round(t.held_sum_ms / t.held_n) : null)],
+    ['ttft p50 / p95', ms(pctl(t.ttft_hist, 0.5)) + ' / ' + ms(pctl(t.ttft_hist, 0.95))],
+    ['gate hold p50 / p95', ms(pctl(t.held_hist, 0.5)) + ' / ' + ms(pctl(t.held_hist, 0.95))],
+    ['relay hop p50 / p95', ms(pctl(t.hop_hist, 0.5)) + ' / ' + ms(pctl(t.hop_hist, 0.95))],
     ['peak concurrency', num(t.peak_concurrency)], ['session moves', num((t.events || {}).session_moved)], ['regions went red', num((t.events || {}).region_red)],
   ].map(([k, v]) => `<div class="tile"><span class="muted">${k}</span><b>${v}</b></div>`).join('');
 }
@@ -157,13 +170,14 @@ async function loadStats() {
   q.set('bucket', days ? 'hour' : 'day');
   try {
     const s = await api('/admin/api/stats?' + q);
+    bounds = s.hist_bounds_ms || [];
     $('tiles').innerHTML = tiles(s.totals);
     const rows = s.series.length ? s.series : [{ key: 'total', label: 'total', totals: s.totals }];
-    $('series').tHead.innerHTML = '<tr><th>' + esc(s.by) + '</th><th>requests</th><th>attempts</th><th>retried</th><th>rescued</th><th>rescue rate</th><th>cache hit</th><th>tokens in</th><th>tokens out</th><th>mean ttft</th><th>peak conc.</th><th>gates</th></tr>';
+    $('series').tHead.innerHTML = '<tr><th>' + esc(s.by) + '</th><th>requests</th><th>attempts</th><th>retried</th><th>rescued</th><th>rescue rate</th><th>cache hit</th><th>tokens in</th><th>tokens out</th><th>ttft p50 / p95</th><th>peak conc.</th><th>gates</th></tr>';
     $('series').tBodies[0].innerHTML = rows.map((r) => { const t = r.totals; return `<tr><td>${esc(r.label)}</td><td>${num(t.requests)}</td><td>${num(t.attempts)}</td>
       <td>${num(t.retried)}</td><td>${num(t.rescued)}</td><td>${pct(t.overload_hit ? t.rescued / t.overload_hit : null)}</td>
       <td>${pct(t.input_tokens ? t.cached_input_tokens / t.input_tokens : null)}</td><td>${num(t.input_tokens)}</td><td>${num(t.output_tokens)}</td>
-      <td>${ms(t.ttft_n ? Math.round(t.ttft_sum_ms / t.ttft_n) : null)}</td><td>${num(t.peak_concurrency)}</td>
+      <td>${ms(pctl(t.ttft_hist, 0.5))} / ${ms(pctl(t.ttft_hist, 0.95))}</td><td>${num(t.peak_concurrency)}</td>
       <td class="muted">${esc(Object.entries(t.gates || {}).map(([k, v]) => k + ' ' + v).join(', '))}</td></tr>`; }).join('');
     const failed = (s.nodes || []).filter((n) => !n.ok);
     $('statsnote').textContent = `${s.scope} scope · ${(s.nodes || []).length} node(s)` + (failed.length ? ` · unreachable: ${failed.map((n) => n.node).join(', ')}` : '')

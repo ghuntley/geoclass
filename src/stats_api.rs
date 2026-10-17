@@ -60,6 +60,10 @@ pub struct StatsResponse {
     /// False when request and session counts are sums over nodes (upper bounds).
     #[serde(default = "yes")]
     pub distinct_exact: bool,
+    /// Upper bounds of the latency histogram buckets (`*_hist` fields); the last bucket holds
+    /// everything above the last bound.
+    #[serde(default)]
+    pub hist_bounds_ms: Vec<i64>,
 }
 
 fn yes() -> bool {
@@ -99,6 +103,7 @@ pub fn query(store: &Store, params: &StatsParams, now: i64, live_inflight: i64, 
         buckets,
         series,
         relay: store.relay_summary(from, to).map_err(|e| e.to_string())?,
+        hist_bounds_ms: crate::hist::BOUNDS_MS.to_vec(),
         nodes: Vec::new(),
         distinct_exact: true,
     })
@@ -256,15 +261,7 @@ pub fn merge_cluster(parts: Vec<StatsResponse>, nodes: Vec<NodeStatus>) -> Optio
         .collect();
     let mut relay: BTreeMap<String, RelaySummary> = BTreeMap::new();
     for r in same.iter().flat_map(|p| &p.relay) {
-        let entry = relay.entry(r.from_region.clone()).or_insert_with(|| RelaySummary { from_region: r.from_region.clone(), ..Default::default() });
-        let n = entry.requests + r.requests;
-        if n > 0 {
-            entry.mean_duration_ms = (entry.mean_duration_ms * entry.requests + r.mean_duration_ms * r.requests) / n;
-        }
-        entry.requests = n;
-        entry.errors += r.errors;
-        entry.bytes += r.bytes;
-        entry.mean_headers_ms = entry.mean_headers_ms.or(r.mean_headers_ms);
+        relay.entry(r.from_region.clone()).or_insert_with(|| RelaySummary { from_region: r.from_region.clone(), ..Default::default() }).add(r);
     }
     Some(StatsResponse {
         scope: "cluster".into(),

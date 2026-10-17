@@ -30,14 +30,14 @@ nix build .#checks.x86_64-linux.geoclass-tailscale-vm
 ## Testing policy (enforced)
 
 1. **Unit tests** (`#[test]`, in-module) cover exact behaviour: header forwarding, gate verdicts, hysteresis thresholds, config validation.
-2. **Property tests** use [Hegel](https://hegel.dev) (`hegeltest`, pinned) in `tests/properties.rs`. They cover invariants over the pure core: placement order-independence and stickiness, retry sequences, gate byte-exactness, binding convergence, health hysteresis, and cluster stats merging. New pure-logic modules must ship properties.
+2. **Property tests** use [Hegel](https://hegel.dev) (`hegeltest`, pinned) in `tests/properties.rs`. They cover invariants over the pure core: placement order-independence and stickiness, retry sequences, gate byte-exactness, binding convergence, health hysteresis, domain learning, histogram merging, and cluster stats merging. New pure-logic modules must ship properties.
 3. **End-to-end tests** in `tests/e2e.rs` mesh three in-process nodes against mock upstreams.
 4. **NixOS machine tests** in `nixos/tests/` cover the service, a three-region mesh, and real Tailscale discovery via headscale.
 5. **No mutation testing** (ADR 0002).
 
 ## Architecture rules
 
-- **Pure sync core, async at the edges.** `placement`, `health`, `bindings`, `domains`, `prior`, `gate`, `sse`, and `stats` take time as a parameter and do no I/O.
+- **Pure sync core, async at the edges.** `placement`, `health`, `hist`, `bindings`, `domains`, `prior`, `gate`, `sse`, and `stats` take time as a parameter and do no I/O.
 - **Regions are opaque.** Never match on, default, or special-case a region name. All region knowledge is operator config (ADR 0006).
 - **Retry only before output.** Only capacity codes, 5xx, and transport errors are retried, and only before the gate commits (ADR 0004). Account-scoped errors always pass through.
 - **A session is its prompt cache key**, and it is sticky until its region has trouble (ADR 0003).
@@ -71,6 +71,8 @@ Use the `code-contracts` skill for every code change and code review. Follow its
   - 0007 chase-the-sun priors as config
   - 0008 statistics store and cluster fan-out
   - 0009 Nix flake, NixOS module, and machine tests
+  - 0010 corroborated failure-domain learning
+  - 0011 mergeable latency histograms
 
 ## Files agents may edit
 

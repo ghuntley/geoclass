@@ -13,7 +13,7 @@ chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 http = "1.5.0"
-lru = "0.18"
+lru = "0.19"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", features = ["blocking", "json", "query", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
